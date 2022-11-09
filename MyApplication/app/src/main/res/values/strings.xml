@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Neuro Chord Decoder</string>
+    <string name="timeStamp">%01$d:%2$02d</string>
+</resources>
