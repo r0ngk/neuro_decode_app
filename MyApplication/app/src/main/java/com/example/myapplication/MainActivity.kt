@@ -1,6 +1,5 @@
 package com.example.myapplication
 
-import android.annotation.SuppressLint
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -8,6 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.OpenableColumns
 import android.widget.Button
+import android.widget.ImageButton
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
@@ -16,37 +16,37 @@ import androidx.appcompat.app.AppCompatActivity
 import com.opencsv.CSVReader
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.Runnable
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import org.apache.commons.lang3.ObjectUtils.Null
-import java.io.File
 import java.io.InputStreamReader
-import kotlin.math.floor
 
 
 class MainActivity : AppCompatActivity() {
 
     // UI
     private lateinit var importButton: Button
-    private lateinit var playButton: Button
+    private lateinit var playButton: ImageButton
     private lateinit var chordLabel: TextView
     private lateinit var seekBarTime: TextView
     private lateinit var audioSeekBar: SeekBar
     private lateinit var trackDescriptLabel: TextView
 
     private lateinit var eegFileUri : Uri
-    private lateinit var eegHeader: Array<String>
     private var isEEGAvaliable: Boolean = false
-    private var chordList = mutableListOf<String>()
+    private lateinit var resultChord: Array<String>
     // seekbar parameter and handler
     private var maxSample = 0
     private var currSample = 0
     private var samplePerSec = 2
     private var updateDelay = (1/samplePerSec*1000).toLong()
     private var isPaused = true
+    private var isEnded = false
     private var seekBarUpdateHandler = Handler(Looper.getMainLooper())
     private var runnableExist = false
     private lateinit var seekBarUpdateRunnable: Runnable
+    // Decoding model
+    private lateinit var decoderAgent: Decoder
+    private lateinit var utils: Utils
+
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -62,6 +62,9 @@ class MainActivity : AppCompatActivity() {
 
         importButton.setOnClickListener {
 
+            if (!isPaused) {
+                togglePlay()
+            }
             val intent = Intent(Intent.ACTION_OPEN_DOCUMENT) //SAF framework
             intent.type = "*/*"
             getContent.launch(intent)
@@ -78,22 +81,36 @@ class MainActivity : AppCompatActivity() {
             override fun onProgressChanged(seek: SeekBar,
                                            progress: Int, fromUser: Boolean) {
                 if (fromUser) {
-                    seekBarTime.text = getString(R.string.timeStamp,
-                        (progress/samplePerSec/60).toInt(), (progress/samplePerSec%60).toInt());
+                    currSample = progress
                 }
-                currSample = progress
+                seekBarTime.text = getString(R.string.timeStamp,
+                    (progress/samplePerSec/60).toInt(), (progress/samplePerSec%60).toInt());
+                // read chord from mem
+                chordLabel.text = resultChord[currSample]
             }
 
             override fun onStartTrackingTouch(seek: SeekBar) {
-                isPaused = true
+//                isPaused = true
             }
 
             override fun onStopTrackingTouch(seek: SeekBar) {
-                isPaused = false
+//              isPaused = false
             }
         })
 
+        utils = Utils()
+        decoderAgent = Decoder(this, utils)
     }
+
+    private fun togglePlay() {
+        isPaused = !isPaused
+        if (isPaused) {
+            playButton.setBackgroundResource(R.drawable.ic_baseline_play_arrow_24)
+        } else {
+            playButton.setBackgroundResource(R.drawable.ic_baseline_pause_24)
+        }
+    }
+
 
     private var getContent = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == RESULT_OK) {
@@ -103,16 +120,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+
     private fun readEEGData() {
 
         GlobalScope.launch {
             // Preparation
-            chordList.clear()
             isEEGAvaliable = false
             maxSample = 0
             if (!isPaused) {
-                isPaused = true
-                playButton.text = "play"
+                togglePlay()
             }
             // handle file details
             var cursor = contentResolver.query(eegFileUri, null, null, null, null)
@@ -120,50 +136,59 @@ class MainActivity : AppCompatActivity() {
             cursor?.moveToFirst()
             var fileName = nameIndex?.let { cursor?.getString(it) }
             var fileExtension = fileName?.substringAfter(".");
-            println(fileExtension)
+//            println(fileExtension)
             // perform read IO
             val inputStream = contentResolver.openInputStream(eegFileUri)
             val csvReader = CSVReader(InputStreamReader(inputStream))
 
             // Read csv file line by line
-            eegHeader = csvReader.readNext()
+            val rawData = mutableListOf<Array<String>>()
+            val header: Array<String> = csvReader.readNext()
             var line: Array<String>? = csvReader.readNext()
             while (line != null) {
-                chordList.add(line[4]) // extract line[4] for the "raw" column
+                rawData.add(line)
                 line = csvReader.readNext()
-                maxSample ++
             }
             csvReader.close()
 
             // set the seekbar
             currSample = 0
-            runOnUiThread {
-                audioSeekBar.progress = 0
-                audioSeekBar.max = maxSample
-                seekBarTime.text = getString(R.string.timeStamp,0,0)
-                chordLabel.text = chordList[0]
-                trackDescriptLabel.text = fileName?.substringBefore(".")
-            }
             isEEGAvaliable = true
+            val tryResult = decoderAgent.go(header, rawData)
+            if (tryResult != null) {
+                resultChord = tryResult
+                maxSample = resultChord.size
+                runOnUiThread {
+                    audioSeekBar.progress = 0
+                    audioSeekBar.max = resultChord.size-1
+                    seekBarTime.text = getString(R.string.timeStamp,0,0)
+                    chordLabel.text = resultChord[0]
+                    trackDescriptLabel.text = "Now Playing:  "+ fileName?.substringBefore(".")
+                }
+            }
         }
     }
 
-
     private fun updateSeekBar() {
-        if (currSample >= maxSample || isPaused) {
+        if (isPaused) {
             return
         }
-        // read chord from mem
-        chordLabel.text = chordList[currSample]
+        if (currSample == maxSample) {
+            if (isEnded) {
+                currSample = 0
+                isEnded = false
+                return
+            }
+            isEnded = true
+            togglePlay()
+            return
+        }
         // update seek bar ui
         audioSeekBar.progress = currSample
-        seekBarTime.text = getString(R.string.timeStamp,
-                                    (currSample/samplePerSec/60).toInt(), (currSample/samplePerSec%60).toInt());
-
         currSample ++
     }
 
-    private fun playDecodedChord(ui: Button) {
+    private fun playDecodedChord(ui: ImageButton) {
         // do nothing if no file if choose
         if (!isEEGAvaliable) {
             Toast.makeText(this@MainActivity,
@@ -171,13 +196,8 @@ class MainActivity : AppCompatActivity() {
                 Toast.LENGTH_SHORT).show()
             return
         }
-        // toggle UI
-        if (isPaused) {
-            ui.text = "pause" //ori UI is "play"
-        } else {
-            ui.text = "play"
-        }
-        isPaused = !isPaused
+
+        togglePlay()
         // set up handler to update the seekbar
         if (runnableExist) {
             return
